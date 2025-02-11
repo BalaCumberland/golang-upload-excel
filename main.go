@@ -93,6 +93,12 @@ func lambdaHandler(request events.APIGatewayProxyRequest) (events.APIGatewayProx
 		return events.APIGatewayProxyResponse{StatusCode: 400, Headers: getCORSHeaders(), Body: `{"error":"Missing duration parameter"}`}, nil
 	}
 
+	quizName, hasQuizName := request.QueryStringParameters["quizName"]
+	if !hasQuizName {
+		log.Println("❌ Missing quizName parameter")
+		return events.APIGatewayProxyResponse{StatusCode: 400, Headers: getCORSHeaders(), Body: `{"error":"Missing quizName parameter"}`}, nil
+	}
+
 	duration, err := strconv.Atoi(durationStr)
 	if err != nil {
 		log.Println("❌ Error parsing duration:", err)
@@ -112,7 +118,7 @@ func lambdaHandler(request events.APIGatewayProxyRequest) (events.APIGatewayProx
 	}
 
 	// ✅ Process Excel File
-	quizData, err := processExcel(fileContent, category, duration, "UploadedQuiz")
+	quizData, err := processExcel(fileContent, category, duration, quizName)
 	if err != nil {
 		log.Println("❌ Error processing Excel file:", err)
 		return events.APIGatewayProxyResponse{StatusCode: 500, Headers: getCORSHeaders(), Body: `{"error":"Failed to process Excel file"}`}, nil
