@@ -34,7 +34,7 @@ type QuizData struct {
 }
 
 type Question struct {
-	Hint             string `json:"hint"`
+	Explanation      string `json:"explanation"`
 	Question         string `json:"question"`
 	CorrectAnswer    string `json:"correctAnswer"`
 	IncorrectAnswers string `json:"incorrectAnswers"`
@@ -251,7 +251,7 @@ func processExcel(fileBytes []byte, category string, duration int, quizName stri
 			continue
 		}
 		questions = append(questions, Question{
-			Hint:             row[0],
+			Explanation:             row[0],
 			Question:         row[1],
 			CorrectAnswer:    row[2],
 			IncorrectAnswers: row[3],
