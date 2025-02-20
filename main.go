@@ -133,70 +133,109 @@ func handleStudentUpdate(request events.LambdaFunctionURLRequest) (events.Lambda
 }
 
 func updateStudent(db *sql.DB, student StudentUpdateRequest) (int64, error) {
+	// ✅ Convert email to lowercase for case-insensitive comparison
+	normalizedEmail := strings.ToLower(student.Email)
+
+	log.Printf("🔍 Updating student: Email = %s", normalizedEmail)
+
+	// ✅ Check existing payment status before updating
+	var existingPaymentStatus string
+	err := db.QueryRow("SELECT payment_status FROM students WHERE LOWER(email) = $1", normalizedEmail).Scan(&existingPaymentStatus)
+	if err != nil {
+		log.Printf("❌ Failed to fetch existing payment status for email %s: %v", normalizedEmail, err)
+		return 0, fmt.Errorf("failed to fetch existing payment status: %w", err)
+	}
+
+	log.Printf("✅ Existing payment status: %s", existingPaymentStatus)
+
 	// ✅ Start Transaction
 	tx, err := db.Begin()
 	if err != nil {
-		return 0, err
+		log.Printf("❌ Failed to begin transaction for email %s: %v", normalizedEmail, err)
+		return 0, fmt.Errorf("failed to begin transaction: %w", err)
 	}
+	defer tx.Rollback() // Rollback if an error occurs
 
 	// ✅ Prepare Dynamic Update Query
 	query := "UPDATE students SET "
-	params := []interface{}{student.Email} // Email is always first
+	params := []interface{}{normalizedEmail} // Email is always first
 	paramIndex := 2
 	updateFields := []string{}
+	updatePaymentTime := false // ✅ Track if `payment_time` should be updated
 
-	if student.PhoneNumber != nil {
+	if student.PhoneNumber != nil && *student.PhoneNumber != "" {
+		log.Printf("📞 Updating phone number: %s", *student.PhoneNumber)
 		updateFields = append(updateFields, fmt.Sprintf("phone_number = $%d", paramIndex))
 		params = append(params, *student.PhoneNumber)
 		paramIndex++
 	}
-	if student.Name != nil {
+	if student.Name != nil && *student.Name != "" {
+		log.Printf("📝 Updating name: %s", *student.Name)
 		updateFields = append(updateFields, fmt.Sprintf("name = $%d", paramIndex))
 		params = append(params, *student.Name)
 		paramIndex++
 	}
-	if student.StudentClass != nil {
+	if student.StudentClass != nil && *student.StudentClass != "" {
+		log.Printf("🏫 Updating student class: %s", *student.StudentClass)
 		updateFields = append(updateFields, fmt.Sprintf("student_class = $%d", paramIndex))
 		params = append(params, *student.StudentClass)
 		paramIndex++
 	}
-	if student.PaymentStatus != nil {
+	if student.PaymentStatus != nil && *student.PaymentStatus != "" {
+		log.Printf("💳 Updating payment status: %s", *student.PaymentStatus)
 		updateFields = append(updateFields, fmt.Sprintf("payment_status = $%d", paramIndex))
 		params = append(params, *student.PaymentStatus)
 		paramIndex++
+
+		// ✅ Update `payment_time` if `payment_status` is changing to "PAID" and wasn't "PAID" before
+		if existingPaymentStatus != "PAID" && *student.PaymentStatus == "PAID" {
+			log.Printf("⏳ Payment status changed to PAID, updating payment_time")
+			updatePaymentTime = true
+		}
 	}
 
-	// ✅ Always Update Timestamp
-	updateFields = append(updateFields, "updated_time = NOW()")
+	// ✅ Update `payment_time` only when payment_status is set to "PAID"
+	if updatePaymentTime {
+		updateFields = append(updateFields, "payment_time = NOW()")
+	}
 
 	// ✅ If No Fields Provided, Return Error
-	if len(updateFields) == 1 {
-		tx.Rollback()
+	if len(updateFields) == 0 {
+		log.Printf("⚠️ No valid fields to update for email: %s", normalizedEmail)
 		return 0, fmt.Errorf("no valid fields to update")
 	}
 
 	// ✅ Construct Final Query
-	query += fmt.Sprintf("%s WHERE email = $1", strings.Join(updateFields, ", "))
+	query += fmt.Sprintf("%s WHERE LOWER(email) = $1", strings.Join(updateFields, ", "))
+
+	log.Printf("📡 Executing query: %s", query)
+
+	// ✅ Execute Query
 	result, err := tx.Exec(query, params...)
 	if err != nil {
-		tx.Rollback()
-		return 0, err
+		log.Printf("❌ Failed to execute update for email %s: %v", normalizedEmail, err)
+		return 0, fmt.Errorf("failed to execute update: %w", err)
 	}
 
 	// ✅ Commit Transaction
 	err = tx.Commit()
 	if err != nil {
-		return 0, err
+		log.Printf("❌ Failed to commit transaction for email %s: %v", normalizedEmail, err)
+		return 0, fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
 	// ✅ Get Number of Updated Rows
 	rowsAffected, err := result.RowsAffected()
 	if err != nil {
-		return 0, err
+		log.Printf("❌ Failed to fetch affected rows for email %s: %v", normalizedEmail, err)
+		return 0, fmt.Errorf("failed to fetch affected rows: %w", err)
 	}
 
+	log.Printf("✅ Successfully updated %d row(s) for email %s", rowsAffected, normalizedEmail)
 	return rowsAffected, nil
 }
+
+
 
 // ✅ Handle Quiz Upload
 func handleQuizUpload(request events.LambdaFunctionURLRequest) (events.LambdaFunctionURLResponse, error) {
