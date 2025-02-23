@@ -2,13 +2,20 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"strconv"
 	"strings"
+
+	"google.golang.org/api/option"
+
+	firebase "firebase.google.com/go"
+	"firebase.google.com/go/auth"
 
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
@@ -16,13 +23,62 @@ import (
 	"github.com/xuri/excelize/v2"
 )
 
+var firebaseAuth *auth.Client
+
+func initFirebase() error {
+	ctx := context.Background()
+	credsJSON := os.Getenv("FIREBASE_SERVICE_ACCOUNT")
+	if credsJSON == "" {
+		return fmt.Errorf("FIREBASE_CREDENTIALS is not set")
+	}
+	var creds map[string]interface{}
+	if err := json.Unmarshal([]byte(credsJSON), &creds); err != nil {
+		return fmt.Errorf("failed to parse FIREBASE_CREDENTIALS: %v", err)
+	}
+
+	conf := &firebase.Config{}
+	app, err := firebase.NewApp(ctx, conf, option.WithCredentialsJSON([]byte(credsJSON)))
+	if err != nil {
+		return fmt.Errorf("error initializing firebase app: %v", err)
+	}
+	firebaseAuth, err = app.Auth(ctx)
+	if err != nil {
+		return fmt.Errorf("error initializing firebase auth client: %v", err)
+	}
+	return nil
+}
+
+func verifyFirebaseToken(request events.LambdaFunctionURLRequest) (*auth.Token, error) {
+	// Look for Authorization header (case-insensitive)
+	authHeader, ok := request.Headers["Authorization"]
+	if !ok {
+		authHeader, ok = request.Headers["authorization"]
+	}
+	if !ok || authHeader == "" {
+		return nil, fmt.Errorf("missing Authorization header")
+	}
+
+	if !strings.HasPrefix(authHeader, "Bearer ") {
+		return nil, fmt.Errorf("invalid Authorization header format")
+	}
+	idToken := strings.TrimPrefix(authHeader, "Bearer ")
+
+	// Verify the token using the Firebase Admin SDK
+	ctx := context.Background()
+	token, err := firebaseAuth.VerifyIDToken(ctx, idToken)
+	if err != nil {
+		return nil, fmt.Errorf("failed to verify token: %v", err)
+	}
+	return token, nil
+}
+
 // ✅ PostgreSQL Database Credentials
 var (
-	DBHost     = "mcq-db.clki64gmuinh.us-east-2.rds.amazonaws.com"
-	DBPort     = "5432"
-	DBUser     = "Kittu"
-	DBPassword = "Kittussk99"
-	DBName     = "mcqdb"
+	DBUser     = os.Getenv("POSTGRESQL_USER")
+	DBHost     = os.Getenv("POSTGRESQL_HOST")
+	DBName     = os.Getenv("POSTGRESQL_DB")
+	DBPassword = os.Getenv("POSTGRESQL_PW")
+	DBPort     = os.Getenv("POSTGRESQL_PORT")
 )
 
 // ✅ Structs
@@ -46,6 +102,7 @@ type StudentUpdateRequest struct {
 	Name          *string `json:"name,omitempty"`
 	StudentClass  *string `json:"studentClass,omitempty"`
 	PaymentStatus *string `json:"paymentStatus,omitempty"`
+	UpdatedBy     *string `json:"updatedBy,omitempty"`
 }
 
 // ✅ Connect to PostgreSQL
@@ -74,6 +131,17 @@ func lambdaHandler(request events.LambdaFunctionURLRequest) (events.LambdaFuncti
 			StatusCode: 200,
 			Headers:    getCORSHeaders(),
 			Body:       `{"message":"CORS preflight response"}`,
+		}, nil
+	}
+
+	// ✅ Verify Firebase ID Token
+	_, err := verifyFirebaseToken(request)
+	if err != nil {
+		log.Printf("❌ Authorization error: %v", err)
+		return events.LambdaFunctionURLResponse{
+			StatusCode: 401,
+			Headers:    getCORSHeaders(),
+			Body:       fmt.Sprintf(`{"error": "Unauthorized", "message": "%s"}`, err.Error()),
 		}, nil
 	}
 
@@ -191,6 +259,9 @@ func updateStudent(db *sql.DB, student StudentUpdateRequest) (int64, error) {
 		if existingPaymentStatus != "PAID" && *student.PaymentStatus == "PAID" {
 			log.Printf("⏳ Payment status changed to PAID, updating payment_time")
 			updatePaymentTime = true
+			updateFields = append(updateFields, fmt.Sprintf("updated_by = $%d", paramIndex))
+			params = append(params, *student.UpdatedBy)
+			paramIndex++
 		}
 	}
 
@@ -234,8 +305,6 @@ func updateStudent(db *sql.DB, student StudentUpdateRequest) (int64, error) {
 	log.Printf("✅ Successfully updated %d row(s) for email %s", rowsAffected, normalizedEmail)
 	return rowsAffected, nil
 }
-
-
 
 // ✅ Handle Quiz Upload
 func handleQuizUpload(request events.LambdaFunctionURLRequest) (events.LambdaFunctionURLResponse, error) {
@@ -290,7 +359,7 @@ func processExcel(fileBytes []byte, category string, duration int, quizName stri
 			continue
 		}
 		questions = append(questions, Question{
-			Explanation:             row[0],
+			Explanation:      row[0],
 			Question:         row[1],
 			CorrectAnswer:    row[2],
 			IncorrectAnswers: row[3],
@@ -344,5 +413,8 @@ func saveToPostgres(quiz QuizData) error {
 
 // ✅ Main Function
 func main() {
+	if err := initFirebase(); err != nil {
+		log.Fatalf("Failed to initialize Firebase: %v", err)
+	}
 	lambda.Start(lambdaHandler)
 }
