@@ -217,7 +217,7 @@ func updateStudent(db *sql.DB, student StudentUpdateRequest) (int64, error) {
 	log.Printf("📅 Existing sub_exp_date: %v", existingSubExpDate.String)
 
 	// ✅ Get today's date in YYYY-MM-DD format
-	today := time.Now().Format("2006-01-02") // ✅ Fix: Missing time package
+	today := time.Now().Format("2006-01-02")
 
 	// ✅ Start Transaction
 	tx, err := db.Begin()
@@ -264,8 +264,11 @@ func updateStudent(db *sql.DB, student StudentUpdateRequest) (int64, error) {
 		params = append(params, *student.Amount)
 		paramIndex++
 
-		// ✅ Check if amount > 0
+		// ✅ Check if amount > 0 to update `payment_time`
 		if *student.Amount > 0 {
+			log.Printf("⏳ Updating payment_time to NOW() since amount > 0")
+			updateFields = append(updateFields, "payment_time = NOW()")
+
 			var newSubExpDate string
 			if existingSubExpDate.Valid && existingSubExpDate.String >= today {
 				// ✅ sub_exp_date is today or future → Extend by 1 year
@@ -288,7 +291,7 @@ func updateStudent(db *sql.DB, student StudentUpdateRequest) (int64, error) {
 				paramIndex++
 			}
 		} else {
-			log.Printf("💰 Amount is 0, skipping sub_exp_date update")
+			log.Printf("💰 Amount is 0, skipping sub_exp_date & payment_time update")
 		}
 	}
 
