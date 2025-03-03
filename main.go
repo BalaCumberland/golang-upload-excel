@@ -2,13 +2,21 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"strconv"
 	"strings"
+	"time"
+
+	"google.golang.org/api/option"
+
+	firebase "firebase.google.com/go"
+	"firebase.google.com/go/auth"
 
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
@@ -16,13 +24,62 @@ import (
 	"github.com/xuri/excelize/v2"
 )
 
+var firebaseAuth *auth.Client
+
+func initFirebase() error {
+	ctx := context.Background()
+	credsJSON := os.Getenv("FIREBASE_SERVICE_ACCOUNT")
+	if credsJSON == "" {
+		return fmt.Errorf("FIREBASE_CREDENTIALS is not set")
+	}
+	var creds map[string]interface{}
+	if err := json.Unmarshal([]byte(credsJSON), &creds); err != nil {
+		return fmt.Errorf("failed to parse FIREBASE_CREDENTIALS: %v", err)
+	}
+
+	conf := &firebase.Config{}
+	app, err := firebase.NewApp(ctx, conf, option.WithCredentialsJSON([]byte(credsJSON)))
+	if err != nil {
+		return fmt.Errorf("error initializing firebase app: %v", err)
+	}
+	firebaseAuth, err = app.Auth(ctx)
+	if err != nil {
+		return fmt.Errorf("error initializing firebase auth client: %v", err)
+	}
+	return nil
+}
+
+func verifyFirebaseToken(request events.LambdaFunctionURLRequest) (*auth.Token, error) {
+	// Look for Authorization header (case-insensitive)
+	authHeader, ok := request.Headers["Authorization"]
+	if !ok {
+		authHeader, ok = request.Headers["authorization"]
+	}
+	if !ok || authHeader == "" {
+		return nil, fmt.Errorf("missing Authorization header")
+	}
+
+	if !strings.HasPrefix(authHeader, "Bearer ") {
+		return nil, fmt.Errorf("invalid Authorization header format")
+	}
+	idToken := strings.TrimPrefix(authHeader, "Bearer ")
+
+	// Verify the token using the Firebase Admin SDK
+	ctx := context.Background()
+	token, err := firebaseAuth.VerifyIDToken(ctx, idToken)
+	if err != nil {
+		return nil, fmt.Errorf("failed to verify token: %v", err)
+	}
+	return token, nil
+}
+
 // ✅ PostgreSQL Database Credentials
 var (
-	DBHost     = "mcq-db.clki64gmuinh.us-east-2.rds.amazonaws.com"
-	DBPort     = "5432"
-	DBUser     = "Kittu"
-	DBPassword = "Kittussk99"
-	DBName     = "mcqdb"
+	DBUser     = os.Getenv("POSTGRESQL_USER")
+	DBHost     = os.Getenv("POSTGRESQL_HOST")
+	DBName     = os.Getenv("POSTGRESQL_DB")
+	DBPassword = os.Getenv("POSTGRESQL_PW")
+	DBPort     = os.Getenv("POSTGRESQL_PORT")
 )
 
 // ✅ Structs
@@ -45,7 +102,8 @@ type StudentUpdateRequest struct {
 	PhoneNumber   *string `json:"phoneNumber,omitempty"`
 	Name          *string `json:"name,omitempty"`
 	StudentClass  *string `json:"studentClass,omitempty"`
-	PaymentStatus *string `json:"paymentStatus,omitempty"`
+	Amount       *float64 `json:"amount,omitempty"`
+	UpdatedBy     *string `json:"updatedBy,omitempty"`
 }
 
 // ✅ Connect to PostgreSQL
@@ -74,6 +132,17 @@ func lambdaHandler(request events.LambdaFunctionURLRequest) (events.LambdaFuncti
 			StatusCode: 200,
 			Headers:    getCORSHeaders(),
 			Body:       `{"message":"CORS preflight response"}`,
+		}, nil
+	}
+
+	// ✅ Verify Firebase ID Token
+	_, err := verifyFirebaseToken(request)
+	if err != nil {
+		log.Printf("❌ Authorization error: %v", err)
+		return events.LambdaFunctionURLResponse{
+			StatusCode: 401,
+			Headers:    getCORSHeaders(),
+			Body:       fmt.Sprintf(`{"error": "Unauthorized", "message": "%s"}`, err.Error()),
 		}, nil
 	}
 
@@ -132,21 +201,23 @@ func handleStudentUpdate(request events.LambdaFunctionURLRequest) (events.Lambda
 	return createSuccessResponse("Student updated successfully"), nil
 }
 
+// ✅ Function to Update Student in Database
 func updateStudent(db *sql.DB, student StudentUpdateRequest) (int64, error) {
-	// ✅ Convert email to lowercase for case-insensitive comparison
 	normalizedEmail := strings.ToLower(student.Email)
-
 	log.Printf("🔍 Updating student: Email = %s", normalizedEmail)
 
-	// ✅ Check existing payment status before updating
-	var existingPaymentStatus string
-	err := db.QueryRow("SELECT payment_status FROM students WHERE LOWER(email) = $1", normalizedEmail).Scan(&existingPaymentStatus)
+	// ✅ Fetch existing sub_exp_date before updating
+	var existingSubExpDate sql.NullString
+	err := db.QueryRow("SELECT sub_exp_date FROM students WHERE LOWER(email) = $1", normalizedEmail).Scan(&existingSubExpDate)
 	if err != nil {
-		log.Printf("❌ Failed to fetch existing payment status for email %s: %v", normalizedEmail, err)
-		return 0, fmt.Errorf("failed to fetch existing payment status: %w", err)
+		log.Printf("❌ Failed to fetch existing sub_exp_date for email %s: %v", normalizedEmail, err)
+		return 0, fmt.Errorf("failed to fetch existing sub_exp_date: %w", err)
 	}
 
-	log.Printf("✅ Existing payment status: %s", existingPaymentStatus)
+	log.Printf("📅 Existing sub_exp_date: %v", existingSubExpDate.String)
+
+	// ✅ Get today's date in YYYY-MM-DD format
+	today := time.Now().Format("2006-01-02") // ✅ Fix: Missing time package
 
 	// ✅ Start Transaction
 	tx, err := db.Begin()
@@ -161,42 +232,64 @@ func updateStudent(db *sql.DB, student StudentUpdateRequest) (int64, error) {
 	params := []interface{}{normalizedEmail} // Email is always first
 	paramIndex := 2
 	updateFields := []string{}
-	updatePaymentTime := false // ✅ Track if `payment_time` should be updated
 
-	if student.PhoneNumber != nil && *student.PhoneNumber != "" {
-		log.Printf("📞 Updating phone number: %s", *student.PhoneNumber)
-		updateFields = append(updateFields, fmt.Sprintf("phone_number = $%d", paramIndex))
-		params = append(params, *student.PhoneNumber)
-		paramIndex++
-	}
+	// ✅ Handle Name Update
 	if student.Name != nil && *student.Name != "" {
 		log.Printf("📝 Updating name: %s", *student.Name)
 		updateFields = append(updateFields, fmt.Sprintf("name = $%d", paramIndex))
 		params = append(params, *student.Name)
 		paramIndex++
 	}
+
+	// ✅ Handle Phone Number Update
+	if student.PhoneNumber != nil && *student.PhoneNumber != "" {
+		log.Printf("📞 Updating phone number: %s", *student.PhoneNumber)
+		updateFields = append(updateFields, fmt.Sprintf("phone_number = $%d", paramIndex))
+		params = append(params, *student.PhoneNumber)
+		paramIndex++
+	}
+
+	// ✅ Handle Student Class Update
 	if student.StudentClass != nil && *student.StudentClass != "" {
 		log.Printf("🏫 Updating student class: %s", *student.StudentClass)
 		updateFields = append(updateFields, fmt.Sprintf("student_class = $%d", paramIndex))
 		params = append(params, *student.StudentClass)
 		paramIndex++
 	}
-	if student.PaymentStatus != nil && *student.PaymentStatus != "" {
-		log.Printf("💳 Updating payment status: %s", *student.PaymentStatus)
-		updateFields = append(updateFields, fmt.Sprintf("payment_status = $%d", paramIndex))
-		params = append(params, *student.PaymentStatus)
+
+	// ✅ Handle Amount Update and Modify sub_exp_date Logic
+	if student.Amount != nil {
+		log.Printf("💰 Updating amount: %f", *student.Amount)
+		updateFields = append(updateFields, fmt.Sprintf("amount = $%d", paramIndex))
+		params = append(params, *student.Amount)
 		paramIndex++
 
-		// ✅ Update `payment_time` if `payment_status` is changing to "PAID" and wasn't "PAID" before
-		if existingPaymentStatus != "PAID" && *student.PaymentStatus == "PAID" {
-			log.Printf("⏳ Payment status changed to PAID, updating payment_time")
-			updatePaymentTime = true
-		}
-	}
+		// ✅ Check if amount > 0
+		if *student.Amount > 0 {
+			var newSubExpDate string
+			if existingSubExpDate.Valid && existingSubExpDate.String >= today {
+				// ✅ sub_exp_date is today or future → Extend by 1 year
+				log.Printf("📅 Extending sub_exp_date by 1 year from %s", existingSubExpDate.String)
+				newSubExpDate = fmt.Sprintf("DATE '%s' + INTERVAL '1 year'", existingSubExpDate.String)
+			} else {
+				// ✅ sub_exp_date is NULL or past → Set to today + 1 year
+				log.Printf("📅 Setting new sub_exp_date as today + 1 year")
+				newSubExpDate = fmt.Sprintf("DATE '%s' + INTERVAL '1 year'", today)
+			}
 
-	// ✅ Update `payment_time` only when payment_status is set to "PAID"
-	if updatePaymentTime {
-		updateFields = append(updateFields, "payment_time = NOW()")
+			// ✅ Append sub_exp_date update
+			updateFields = append(updateFields, fmt.Sprintf("sub_exp_date = %s", newSubExpDate))
+
+			// ✅ Ensure UpdatedBy is set if amount > 0
+			if student.UpdatedBy != nil && *student.UpdatedBy != "" {
+				log.Printf("👤 Updated by: %s", *student.UpdatedBy)
+				updateFields = append(updateFields, fmt.Sprintf("updated_by = $%d", paramIndex))
+				params = append(params, *student.UpdatedBy)
+				paramIndex++
+			}
+		} else {
+			log.Printf("💰 Amount is 0, skipping sub_exp_date update")
+		}
 	}
 
 	// ✅ If No Fields Provided, Return Error
@@ -234,6 +327,7 @@ func updateStudent(db *sql.DB, student StudentUpdateRequest) (int64, error) {
 	log.Printf("✅ Successfully updated %d row(s) for email %s", rowsAffected, normalizedEmail)
 	return rowsAffected, nil
 }
+
 
 
 
@@ -290,7 +384,7 @@ func processExcel(fileBytes []byte, category string, duration int, quizName stri
 			continue
 		}
 		questions = append(questions, Question{
-			Explanation:             row[0],
+			Explanation:      row[0],
 			Question:         row[1],
 			CorrectAnswer:    row[2],
 			IncorrectAnswers: row[3],
@@ -344,5 +438,8 @@ func saveToPostgres(quiz QuizData) error {
 
 // ✅ Main Function
 func main() {
+	if err := initFirebase(); err != nil {
+		log.Fatalf("Failed to initialize Firebase: %v", err)
+	}
 	lambda.Start(lambdaHandler)
 }
