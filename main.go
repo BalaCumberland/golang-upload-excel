@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"errors"
 
 	"google.golang.org/api/option"
 
@@ -368,7 +369,6 @@ func handleQuizUpload(request events.LambdaFunctionURLRequest) (events.LambdaFun
 	return createSuccessResponse("Quiz uploaded successfully"), nil
 }
 
-// ✅ Process Excel File
 func processExcel(fileBytes []byte, category string, duration int, quizName string) (QuizData, error) {
 	f, err := excelize.OpenReader(bytes.NewReader(fileBytes))
 	if err != nil {
@@ -381,20 +381,44 @@ func processExcel(fileBytes []byte, category string, duration int, quizName stri
 		return QuizData{}, err
 	}
 
+	if len(rows) < 2 {
+		return QuizData{}, errors.New("insufficient data in the file")
+	}
+
+	// Read headers from the first row
+	headerMap := make(map[string]int)
+	for i, header := range rows[0] {
+		headerMap[header] = i
+	}
+
+	// Required headers
+	requiredHeaders := []string{"Question", "CorrectAnswer", "IncorrectAnswers", "Explanation"}
+	for _, header := range requiredHeaders {
+		if _, exists := headerMap[header]; !exists {
+			return QuizData{}, fmt.Errorf("missing required column: %s", header)
+		}
+	}
+
 	var questions []Question
 	for _, row := range rows[1:] {
-		if len(row) < 4 {
-			continue
-		}
 		questions = append(questions, Question{
-			Explanation:      row[0],
-			Question:         row[1],
-			CorrectAnswer:    row[2],
-			IncorrectAnswers: row[3],
+			Question:         getCellValue(row, headerMap, "Question"),
+			CorrectAnswer:    getCellValue(row, headerMap, "CorrectAnswer"),
+			IncorrectAnswers: getCellValue(row, headerMap, "IncorrectAnswers"),
+			Explanation:      getCellValue(row, headerMap, "Explanation"),
 		})
 	}
 
 	return QuizData{QuizName: quizName, Duration: duration, Category: category, Questions: questions}, nil
+}
+
+// Helper function to get cell value safely
+func getCellValue(row []string, headerMap map[string]int, key string) string {
+	index, exists := headerMap[key]
+	if !exists || index >= len(row) {
+		return ""
+	}
+	return row[index]
 }
 
 // ✅ Utility: Create Success Response
